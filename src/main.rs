@@ -1,10 +1,53 @@
+use axum::http::StatusCode;
+use axum::{routing::{post, get}, Router, Server};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::util::psbt::PartiallySignedTransaction;
 use bitcoin::Address;
 use bitcoin::Network;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::SocketAddr;
+use tower_http::cors::{Any, CorsLayer};
 
-pub fn parse_psbt(base64_psbt: &str, network: Option<Network>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn serialize_network<S>(network: &Option<Network>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match network {
+        Some(n) => serializer.serialize_str(&n.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_network<'de, D>(deserializer: D) -> Result<Option<Network>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(deserializer)?;
+    match s {
+        Some(s) => {
+            Ok(Some(s.parse().map_err(|_| {
+                serde::de::Error::custom("failed to parse network")
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ParsePsbtRequest {
+    psbt: String,
+    #[serde(
+        serialize_with = "serialize_network",
+        deserialize_with = "deserialize_network"
+    )]
+    network: Option<Network>,
+}
+
+pub fn parse_psbt(
+    base64_psbt: &str,
+    network: Option<Network>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let network = network.unwrap_or(Network::Bitcoin);
 
     // Decode the base64 PSBT
@@ -29,7 +72,13 @@ pub fn parse_psbt(base64_psbt: &str, network: Option<Network>) -> Result<serde_j
             input
                 .witness_utxo
                 .as_ref()
-                .or_else(|| input.non_witness_utxo.as_ref()?.output.get(prevout.vout as usize))
+                .or_else(|| {
+                    input
+                        .non_witness_utxo
+                        .as_ref()?
+                        .output
+                        .get(prevout.vout as usize)
+                })
                 .map(|output| Address::from_script(&output.script_pubkey, network))
         })
         .filter_map(|addr| addr)
@@ -57,7 +106,13 @@ pub fn parse_psbt(base64_psbt: &str, network: Option<Network>) -> Result<serde_j
             input
                 .witness_utxo
                 .as_ref()
-                .or_else(|| input.non_witness_utxo.as_ref()?.output.get(prevout.vout as usize))
+                .or_else(|| {
+                    input
+                        .non_witness_utxo
+                        .as_ref()?
+                        .output
+                        .get(prevout.vout as usize)
+                })
                 .map(|output| output.value)
         })
         .sum();
@@ -76,15 +131,31 @@ pub fn parse_psbt(base64_psbt: &str, network: Option<Network>) -> Result<serde_j
     Ok(result)
 }
 
-fn main() {
-    let base64_psbt = "cHNidP8BAH0BAAAAAdAW0fnwMGYPMqstz4OSdpISfRRFqUUBMG6zTWoS4efaAAAAAAD9////AuJEAAAAAAAAIgAgSvL25OUMP0hwhBoBK4JWzBB2DwM94NhyEsKve8+JbCjoAwAAAAAAABYAFLTI5y7+f3LbbI3D/NpL65mwux5RCwolAAABAP1bAQEAAAAAAQEfO9PBcoAslgtoed83CQqpFvsRdxwstQ10N2HzNdqdHgAAAAAA/v///wKASQAAAAAAACIAILmGho/bMu5shj75Emjq5uR6msL6lc3vlEBqQeJfZ0bg6gMAAAAAAAAWABT8sJkS7IVjbkC/6bFynhFRf+JupQMARzBEAiBjuRSXbEituqaV8ulfcxI62+7svFQ0ZAPqlLfEsvPFwgIgNQEdzuzmE05zCdBWz5D+u2KF8Fncle0fiMjJhv9qVC0BkVEhAvqn8w25vLaWUgEb0/5IuPkEqfEl1R4r5krx/hXU90CJIQOdlP7/99bWcU52WgsWKdi9cl0yFNUwWHUpogbKJ81ImFKuZFEhAmnLtZoMZeOWWyGhn1sMDGJ1UOwl8os2nsKLH0flmzvOIQNBD1APODznI6ZVn3sSwoeHgqxfIxdBoLGCJKxsOOWPDVKvaFGm9yQAAQErgEkAAAAAAAAiACC5hoaP2zLubIY++RJo6ubkeprC+pXN75RAakHiX2dG4AEFkVEhAzC0MbE8y3TOip/KPxlVNmV3Q1xGST2XPDSXTGmu0ZwcIQJ47Jdx6vg2C/c8jRp86Hejq6+8hACL56RM4PRfTJUA5FKuZFEhAn9puKCUw4woSojoEaAF281G5VXWFIZ2JQSwMkAiVYUpIQOrZ73iJizUHCMubR/cfOINi3noMBKDDmDfL0tZ1A+KJFKvaFEiBgJ47Jdx6vg2C/c8jRp86Hejq6+8hACL56RM4PRfTJUA5BiaaiWAVAAAgAEAAIAAAACAAAAAAAEAAAAiBgJ/abiglMOMKEqI6BGgBdvNRuVV1hSGdiUEsDJAIlWFKRhj43UmVAAAgAEAAIAAAACAAAAAAAEAAAAiBgMwtDGxPMt0zoqfyj8ZVTZld0NcRkk9lzw0l0xprtGcHBgStKcNVAAAgAEAAIAAAACAAAAAAAEAAAAiBgOrZ73iJizUHCMubR/cfOINi3noMBKDDmDfL0tZ1A+KJBi9giqnVAAAgAEAAIAAAACAAAAAAAEAAAAAAQGRUSECrrZFU9MUPkV5N+BDet3cNgSmBzzkrhI2ExCVTbwp0n4hAwD0fG8Hcz9uVqGuHfF8FBl9M9FAem1kXJ3sj6OuA88ZUq5kUSEDWSvleVbWe95GxWwzuZ8aH1ltZXCI5pRovfs6v+q2K3MhA6XzA+f8l8ul/Kv0lKNoveZ6AEeu0DYRze9T6cdq+ds2Uq9oUSICAq62RVPTFD5FeTfgQ3rd3DYEpgc85K4SNhMQlU28KdJ+GBK0pw1UAACAAQAAgAAAAIABAAAAAAAAACICAwD0fG8Hcz9uVqGuHfF8FBl9M9FAem1kXJ3sj6OuA88ZGJpqJYBUAACAAQAAgAAAAIABAAAAAAAAACICA1kr5XlW1nveRsVsM7mfGh9ZbWVwiOaUaL37Or/qtitzGGPjdSZUAACAAQAAgAAAAIABAAAAAAAAACICA6XzA+f8l8ul/Kv0lKNoveZ6AEeu0DYRze9T6cdq+ds2GL2CKqdUAACAAQAAgAAAAIABAAAAAAAAAAAA"; // Replace this with a real base64 PSBT
 
-    match parse_psbt(base64_psbt, Some(Network::Testnet)) { // Change the network here
-        Ok(parsed) => {
-            println!("Parsed PSBT: {}", parsed);
-        }
-        Err(e) => {
-            eprintln!("Error parsing PSBT: {}", e);
-        }
-    }
+async fn parse_psbt_handler(
+    axum::Json(ParsePsbtRequest { psbt, network }): axum::Json<ParsePsbtRequest>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let result = parse_psbt(&psbt, network).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(axum::response::Json(result))
+}
+
+#[tokio::main]
+async fn main() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 42069));
+
+    let service = router().await.into_make_service();
+    Server::bind(&addr)
+        .serve(service)
+        .await
+        .expect("server failed");
+}
+
+async fn router() -> Router {
+    let cors = CorsLayer::new().allow_origin(Any);
+
+    Router::new()
+        .layer(cors)
+        .route("/parse_psbt", post(parse_psbt_handler))
+        .route("/", get(|| async { "health check" }))
 }
