@@ -119,13 +119,22 @@ pub fn parse_psbt(
 
     let fee = input_amount - tx.output.iter().map(|output| output.value).sum::<u64>();
 
-    // Create the JSON object
+    let mut pay_to_info = Vec::new();
+    for output in tx.output {
+        let address = Address::from_script(&output.script_pubkey, network).unwrap();
+        pay_to_info.push(json!({
+            "amount": output.value,
+            "pay_to": address.to_string(),
+        }));
+    }
+
     let result = json!({
         "txid": txid,
         "send_address": send_address,
         "input_addresses": input_addresses,
         "fee": fee,
         "total_amount": total_amount,
+        "pay_to_info": pay_to_info,
     });
 
     Ok(result)
@@ -142,7 +151,7 @@ async fn parse_psbt_handler(
 
 #[tokio::main]
 async fn main() {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 42069));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3069));
 
     let service = router().await.into_make_service();
     Server::bind(&addr)
