@@ -1,13 +1,10 @@
-use axum::http::StatusCode;
-use axum::{routing::{post, get}, Router, Server};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::util::psbt::PartiallySignedTransaction;
 use bitcoin::Address;
 use bitcoin::Network;
+use lambda_http::{run, service_fn, Body, Error, Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
 
 fn serialize_network<S>(network: &Option<Network>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -140,31 +137,55 @@ pub fn parse_psbt(
     Ok(result)
 }
 
+#[derive(Debug, Deserialize)]
+struct LambdaRequest {
+    psbt: String,
+    network: Option<String>,
+}
 
-async fn parse_psbt_handler(
-    axum::Json(ParsePsbtRequest { psbt, network }): axum::Json<ParsePsbtRequest>,
-) -> Result<impl axum::response::IntoResponse, StatusCode> {
-    let result = parse_psbt(&psbt, network).map_err(|_| StatusCode::BAD_REQUEST)?;
+#[derive(Debug, Serialize)]
+struct LambdaResponse {
+    txid: String,
+    send_address: String,
+    input_addresses: Vec<String>,
+    fee: u64,
+    total_amount: u64,
+    pay_to_info: Vec<serde_json::Value>,
+}
 
-    Ok(axum::response::Json(result))
+async fn function_handler(event: Request) -> Result<Response<Body>, Error> {
+    let body = event.into_body();
+
+    let lambda_request: LambdaRequest = serde_json::from_slice(&body).unwrap();
+    
+    let network = lambda_request.network.map(|n| n.parse().unwrap_or(Network::Testnet));
+
+    let result = parse_psbt(&lambda_request.psbt, network).unwrap();
+
+    let response = LambdaResponse {
+        txid: result["txid"].as_str().unwrap().to_owned(),
+        send_address: result["send_address"].as_str().unwrap().to_owned(),
+        input_addresses: serde_json::from_value(result["input_addresses"].clone()).unwrap(),
+        fee: result["fee"].as_u64().unwrap(),
+        total_amount: result["total_amount"].as_u64().unwrap(),
+        pay_to_info: serde_json::from_value(result["pay_to_info"].clone()).unwrap(),
+    };
+
+    let response_json = serde_json::to_string(&response).unwrap();
+
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(Body::from(response_json))
+        .unwrap())
 }
 
 #[tokio::main]
-async fn main() {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3069));
-
-    let service = router().await.into_make_service();
-    Server::bind(&addr)
-        .serve(service)
-        .await
-        .expect("server failed");
-}
-
-async fn router() -> Router {
-    let cors = CorsLayer::new().allow_origin(Any);
-
-    Router::new()
-        .layer(cors)
-        .route("/parse_psbt", post(parse_psbt_handler))
-        .route("/", get(|| async { "health check" }))
+async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .without_time()
+        .init();
+    run(service_fn(function_handler)).await
 }
