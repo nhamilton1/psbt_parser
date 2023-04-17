@@ -45,7 +45,7 @@ pub fn parse_psbt(
     base64_psbt: &str,
     network: Option<Network>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let network = network.unwrap_or(Network::Bitcoin);
+    let network = network.unwrap_or(Network::Testnet);
 
     // Decode the base64 PSBT
     let decoded_psbt = base64::decode(base64_psbt)?;
@@ -156,9 +156,21 @@ struct LambdaResponse {
 async fn function_handler(event: Request) -> Result<Response<Body>, Error> {
     let body = event.into_body();
 
-    let lambda_request: LambdaRequest = serde_json::from_slice(&body).unwrap();
-    
-    let network = lambda_request.network.map(|n| n.parse().unwrap_or(Network::Testnet));
+    let lambda_request: LambdaRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            let error_message = format!("Invalid request: {}", e);
+            let response = Response::builder()
+                .status(400)
+                .body(Body::from(error_message))
+                .unwrap();
+            return Ok(response);
+        }
+    };
+
+    let network = lambda_request
+        .network
+        .map(|n| n.parse().unwrap_or(Network::Testnet));
 
     let result = parse_psbt(&lambda_request.psbt, network).unwrap();
 
